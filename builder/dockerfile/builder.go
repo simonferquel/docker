@@ -1,22 +1,18 @@
 package dockerfile
 
 import (
-	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"strings"
 
 	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/backend"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/builder"
-	"github.com/docker/docker/builder/dockerfile/command"
+	"github.com/docker/docker/builder/dockerfile/buildtree"
 	"github.com/docker/docker/builder/dockerfile/parser"
 	"github.com/docker/docker/builder/remotecontext"
 	"github.com/docker/docker/pkg/streamformatter"
-	"github.com/docker/docker/pkg/stringid"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 	"golang.org/x/sync/syncmap"
@@ -101,13 +97,13 @@ type Builder struct {
 	source    builder.Source
 	clientCtx context.Context
 
-	tmpContainers map[string]struct{}
-	buildStages   *buildStages
 	disableCommit bool
 	cacheBusted   bool
 	buildArgs     *buildArgs
 	imageCache    builder.ImageCache
-	imageSources  *imageSources
+	imageSources  builder.ImageMounts
+
+	buildTree buildtree.BuildTree
 }
 
 // newBuilder creates a new Dockerfile builder from an optional dockerfile and a Options.
@@ -117,17 +113,16 @@ func newBuilder(clientCtx context.Context, options builderOptions) *Builder {
 		config = new(types.ImageBuildOptions)
 	}
 	b := &Builder{
-		clientCtx:     clientCtx,
-		options:       config,
-		Stdout:        options.ProgressWriter.StdoutFormatter,
-		Stderr:        options.ProgressWriter.StderrFormatter,
-		Aux:           options.ProgressWriter.AuxFormatter,
-		Output:        options.ProgressWriter.Output,
-		docker:        options.Backend,
-		tmpContainers: map[string]struct{}{},
-		buildArgs:     newBuildArgs(config.BuildArgs),
-		buildStages:   newBuildStages(),
-		imageSources:  newImageSources(clientCtx, options),
+		clientCtx:    clientCtx,
+		options:      config,
+		Stdout:       options.ProgressWriter.StdoutFormatter,
+		Stderr:       options.ProgressWriter.StderrFormatter,
+		Aux:          options.ProgressWriter.AuxFormatter,
+		Output:       options.ProgressWriter.Output,
+		docker:       options.Backend,
+		buildArgs:    newBuildArgs(config.BuildArgs),
+		imageSources: newImageSources(clientCtx, options),
+		buildTree:    buildtree.NewBuildTree(),
 	}
 	return b
 }
@@ -154,86 +149,60 @@ func (b *Builder) build(source builder.Source, dockerfile *parser.Result) (*buil
 		return nil, err
 	}
 
-	dispatchState, err := b.dispatchDockerfileWithCancellation(dockerfile)
+	err := b.parseBuildTree(dockerfile)
 	if err != nil {
 		return nil, err
 	}
 
-	if b.options.Target != "" && !dispatchState.isCurrentStage(b.options.Target) {
-		buildsFailed.WithValues(metricsBuildTargetNotReachableError).Inc()
-		return nil, errors.Errorf("failed to reach build target %s in Dockerfile", b.options.Target)
+	if b.options.Target != "" {
+		if err = b.buildTree.SetTargetStage(b.options.Target); err != nil {
+			buildsFailed.WithValues(metricsBuildTargetNotReachableError).Inc()
+			return nil, errors.Errorf("failed to reach build target %s in Dockerfile: %v", b.options.Target, err)
+		}
 	}
 
 	b.buildArgs.WarnOnUnusedBuildArgs(b.Stderr)
 
-	if dispatchState.imageID == "" {
-		buildsFailed.WithValues(metricsDockerfileEmptyError).Inc()
-		return nil, errors.New("No image was generated. Is your Dockerfile empty?")
+	treeOptions := &buildtree.BuildOptions{
+		Ctx:           b.clientCtx,
+		DisableCommit: b.disableCommit,
+		Docker:        b.docker,
+		ImageCache:    b.imageCache,
+		ImageSources:  b.imageSources,
+		NoCache:       b.options.NoCache,
+		Options:       b.options,
+		Output:        b.Output,
+		Stderr:        b.Stderr,
+		Stdout:        b.Stdout,
 	}
-	return &builder.Result{ImageID: dispatchState.imageID, FromImage: dispatchState.baseImage}, nil
+
+	return b.buildTree.Run(treeOptions)
 }
 
-func emitImageID(aux *streamformatter.AuxFormatter, state *dispatchState) error {
-	if aux == nil || state.imageID == "" {
-		return nil
-	}
-	return aux.Emit(types.BuildResult{ID: state.imageID})
-}
-
-func (b *Builder) dispatchDockerfileWithCancellation(dockerfile *parser.Result) (*dispatchState, error) {
+func (b *Builder) parseBuildTree(dockerfile *parser.Result) error {
 	shlex := NewShellLex(dockerfile.EscapeToken)
 	state := newDispatchState()
-	total := len(dockerfile.AST.Children)
 	var err error
-	for i, n := range dockerfile.AST.Children {
+	for _, n := range dockerfile.AST.Children {
 		select {
 		case <-b.clientCtx.Done():
 			logrus.Debug("Builder: build cancelled!")
 			fmt.Fprint(b.Stdout, "Build cancelled")
 			buildsFailed.WithValues(metricsBuildCanceled).Inc()
-			return nil, errors.New("Build cancelled")
+			return errors.New("Build cancelled")
 		default:
 			// Not cancelled yet, keep going...
 		}
-
-		// If this is a FROM and we have a previous image then
-		// emit an aux message for that image since it is the
-		// end of the previous stage
-		if n.Value == command.From {
-			if err := emitImageID(b.Aux, state); err != nil {
-				return nil, err
-			}
-		}
-
-		if n.Value == command.From && state.isCurrentStage(b.options.Target) {
-			break
-		}
-
 		opts := dispatchOptions{
-			state:   state,
-			stepMsg: formatStep(i, total),
-			node:    n,
-			shlex:   shlex,
+			state: state,
+			node:  n,
+			shlex: shlex,
 		}
-		if state, err = b.dispatch(opts); err != nil {
-			if b.options.ForceRemove {
-				b.clearTmp()
-			}
-			return nil, err
-		}
-
-		fmt.Fprintf(b.Stdout, " ---> %s\n", stringid.TruncateID(state.imageID))
-		if b.options.Remove {
-			b.clearTmp()
+		if err = b.dispatch(opts); err != nil {
+			return err
 		}
 	}
-
-	// Emit a final aux message for the final image
-	if err := emitImageID(b.Aux, state); err != nil {
-		return nil, err
-	}
-
-	return state, nil
+	return nil
 }
 
 func addNodesForLabelOption(dockerfile *parser.Node, labels map[string]string) {
@@ -255,34 +224,36 @@ func addNodesForLabelOption(dockerfile *parser.Node, labels map[string]string) {
 //
 // TODO: Remove?
 func BuildFromConfig(config *container.Config, changes []string) (*container.Config, error) {
-	if len(changes) == 0 {
-		return config, nil
-	}
+	// if len(changes) == 0 {
+	// 	return config, nil
+	// }
 
-	b := newBuilder(context.Background(), builderOptions{})
+	// b := newBuilder(context.Background(), builderOptions{})
 
-	dockerfile, err := parser.Parse(bytes.NewBufferString(strings.Join(changes, "\n")))
-	if err != nil {
-		return nil, err
-	}
+	// dockerfile, err := parser.Parse(bytes.NewBufferString(strings.Join(changes, "\n")))
+	// if err != nil {
+	// 	return nil, err
+	// }
 
-	// ensure that the commands are valid
-	for _, n := range dockerfile.AST.Children {
-		if !validCommitCommands[n.Value] {
-			return nil, fmt.Errorf("%s is not a valid change command", n.Value)
-		}
-	}
+	// // ensure that the commands are valid
+	// for _, n := range dockerfile.AST.Children {
+	// 	if !validCommitCommands[n.Value] {
+	// 		return nil, fmt.Errorf("%s is not a valid change command", n.Value)
+	// 	}
+	// }
 
-	b.Stdout = ioutil.Discard
-	b.Stderr = ioutil.Discard
-	b.disableCommit = true
+	// b.Stdout = ioutil.Discard
+	// b.Stderr = ioutil.Discard
+	// b.disableCommit = true
 
-	if err := checkDispatchDockerfile(dockerfile.AST); err != nil {
-		return nil, err
-	}
-	dispatchState := newDispatchState()
-	dispatchState.runConfig = config
-	return dispatchFromDockerfile(b, dockerfile, dispatchState)
+	// if err := checkDispatchDockerfile(dockerfile.AST); err != nil {
+	// 	return nil, err
+	// }
+	// dispatchState := newDispatchState()
+	// dispatchState.runConfig = config
+	// return dispatchFromDockerfile(b, dockerfile, dispatchState)
+
+	return nil, errors.New("Not implemented")
 }
 
 func checkDispatchDockerfile(dockerfile *parser.Node) error {
@@ -294,7 +265,7 @@ func checkDispatchDockerfile(dockerfile *parser.Node) error {
 	return nil
 }
 
-func dispatchFromDockerfile(b *Builder, result *parser.Result, dispatchState *dispatchState) (*container.Config, error) {
+func dispatchFromDockerfile(b *Builder, result *parser.Result, dispatchState *dispatchState) error {
 	shlex := NewShellLex(result.EscapeToken)
 	ast := result.AST
 	total := len(ast.Children)
@@ -306,9 +277,9 @@ func dispatchFromDockerfile(b *Builder, result *parser.Result, dispatchState *di
 			node:    n,
 			shlex:   shlex,
 		}
-		if _, err := b.dispatch(opts); err != nil {
-			return nil, err
+		if err := b.dispatch(opts); err != nil {
+			return err
 		}
 	}
-	return dispatchState.runConfig, nil
+	return nil
 }

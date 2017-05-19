@@ -104,12 +104,11 @@ type getAndMountFunc func(string) (builder.Image, builder.ReleaseableLayer, erro
 // imageSources mounts images and provides a cache for mounted images. It tracks
 // all images so they can be unmounted at the end of the build.
 type imageSources struct {
-	byImageID map[string]*imageMount
+	byImageID map[string]builder.ImageMount
 	getImage  getAndMountFunc
-	cache     pathCache // TODO: remove
 }
 
-func newImageSources(ctx context.Context, options builderOptions) *imageSources {
+func newImageSources(ctx context.Context, options builderOptions) builder.ImageMounts {
 	getAndMount := func(idOrRef string) (builder.Image, builder.ReleaseableLayer, error) {
 		return options.Backend.GetImageAndReleasableLayer(ctx, idOrRef, backend.GetImageAndLayerOptions{
 			ForcePull:  options.Options.PullParent,
@@ -119,12 +118,12 @@ func newImageSources(ctx context.Context, options builderOptions) *imageSources 
 	}
 
 	return &imageSources{
-		byImageID: make(map[string]*imageMount),
+		byImageID: make(map[string]builder.ImageMount),
 		getImage:  getAndMount,
 	}
 }
 
-func (m *imageSources) Get(idOrRef string) (*imageMount, error) {
+func (m *imageSources) Get(idOrRef string) (builder.ImageMount, error) {
 	if im, ok := m.byImageID[idOrRef]; ok {
 		return im, nil
 	}
@@ -140,29 +139,12 @@ func (m *imageSources) Get(idOrRef string) (*imageMount, error) {
 
 func (m *imageSources) Unmount() (retErr error) {
 	for _, im := range m.byImageID {
-		if err := im.unmount(); err != nil {
+		if err := im.Unmount(); err != nil {
 			logrus.Error(err)
 			retErr = err
 		}
 	}
 	return
-}
-
-// TODO: remove getCache/setCache from imageSources
-func (m *imageSources) getCache(id, path string) (interface{}, bool) {
-	if m.cache != nil {
-		if id == "" {
-			return nil, false
-		}
-		return m.cache.Load(id + path)
-	}
-	return nil, false
-}
-
-func (m *imageSources) setCache(id, path string, v interface{}) {
-	if m.cache != nil {
-		m.cache.Store(id+path, v)
-	}
 }
 
 // imageMount is a reference to an image that can be used as a builder.Source
@@ -172,7 +154,7 @@ type imageMount struct {
 	layer  builder.ReleaseableLayer
 }
 
-func newImageMount(image builder.Image, layer builder.ReleaseableLayer) *imageMount {
+func newImageMount(image builder.Image, layer builder.ReleaseableLayer) builder.ImageMount {
 	im := &imageMount{image: image, layer: layer}
 	return im
 }
@@ -195,7 +177,7 @@ func (im *imageMount) Source() (builder.Source, error) {
 	return im.source, nil
 }
 
-func (im *imageMount) unmount() error {
+func (im *imageMount) Unmount() error {
 	if im.layer == nil {
 		return nil
 	}

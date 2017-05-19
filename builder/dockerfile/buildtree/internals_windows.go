@@ -1,4 +1,4 @@
-package dockerfile
+package buildtree
 
 import (
 	"fmt"
@@ -8,6 +8,8 @@ import (
 
 	"github.com/docker/docker/pkg/system"
 )
+
+var defaultShell = []string{"cmd", "/S", "/C"}
 
 // normaliseDest normalises the destination of a COPY/ADD command in a
 // platform semantically consistent way.

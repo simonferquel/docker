@@ -97,3 +97,15 @@ type ReleaseableLayer interface {
 	Release() error
 	Mount() (string, error)
 }
+
+// imageMount is a reference to an image that can be used as a builder.Source
+type ImageMount interface {
+	Source() (Source, error)
+	Unmount() error
+	Image() Image
+}
+
+type ImageMounts interface {
+	Get(idOrRef string) (ImageMount, error)
+	Unmount() error
+}

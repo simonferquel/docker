@@ -1,6 +1,6 @@
 // +build !windows
 
-package dockerfile
+package buildtree
 
 import (
 	"os"
@@ -9,6 +9,8 @@ import (
 
 	"github.com/docker/docker/pkg/system"
 )
+
+var defaultShell = []string{"/bin/sh", "-c"}
 
 // normaliseDest normalises the destination of a COPY/ADD command in a
 // platform semantically consistent way.

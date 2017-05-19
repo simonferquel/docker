@@ -1,6 +1,6 @@
 // +build windows
 
-package dockerfile
+package buildtree
 
 import "testing"
 
