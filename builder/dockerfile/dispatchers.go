@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"regexp"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -310,31 +309,6 @@ func run(req dispatchRequest) error {
 	}
 	args := handleJSONArgs(req.args, req.attributes)
 	return buildtree.NewRunBuildStep(req.builder.buildTree.LastStage(), args, !req.attributes["json"])
-}
-
-// Derive the command to use for probeCache() and to commit in this container.
-// Note that we only do this if there are any build-time env vars.  Also, we
-// use the special argument "|#" at the start of the args array. This will
-// avoid conflicts with any RUN command since commands can not
-// start with | (vertical bar). The "#" (number of build envs) is there to
-// help ensure proper cache matches. We don't want a RUN command
-// that starts with "foo=abc" to be considered part of a build-time env var.
-//
-// remove any unreferenced built-in args from the environment variables.
-// These args are transparent so resulting image should be the same regardless
-// of the value.
-func prependEnvOnCmd(buildArgs *buildArgs, buildArgVars []string, cmd strslice.StrSlice) strslice.StrSlice {
-	var tmpBuildEnv []string
-	for _, env := range buildArgVars {
-		key := strings.SplitN(env, "=", 2)[0]
-		if buildArgs.IsReferencedOrNotBuiltin(key) {
-			tmpBuildEnv = append(tmpBuildEnv, env)
-		}
-	}
-
-	sort.Strings(tmpBuildEnv)
-	tmpEnv := append([]string{fmt.Sprintf("|%d", len(tmpBuildEnv))}, tmpBuildEnv...)
-	return strslice.StrSlice(append(tmpEnv, cmd...))
 }
 
 // CMD foo

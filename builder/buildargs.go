@@ -1,9 +1,10 @@
-package dockerfile
+package builder
 
 import (
 	"fmt"
-	"github.com/docker/docker/runconfig/opts"
 	"io"
+
+	"github.com/docker/docker/runconfig/opts"
 )
 
 // builtinAllowedBuildArgs is list of built-in allowed build args
@@ -21,7 +22,7 @@ var builtinAllowedBuildArgs = map[string]bool{
 }
 
 // buildArgs manages arguments used by the builder
-type buildArgs struct {
+type BuildArgs struct {
 	// args that are allowed for expansion/substitution and passing to commands in 'run'.
 	allowedBuildArgs map[string]*string
 	// args defined before the first `FROM` in a Dockerfile
@@ -32,8 +33,8 @@ type buildArgs struct {
 	argsFromOptions map[string]*string
 }
 
-func newBuildArgs(argsFromOptions map[string]*string) *buildArgs {
-	return &buildArgs{
+func NewBuildArgs(argsFromOptions map[string]*string) *BuildArgs {
+	return &BuildArgs{
 		allowedBuildArgs: make(map[string]*string),
 		allowedMetaArgs:  make(map[string]*string),
 		referencedArgs:   make(map[string]struct{}),
@@ -43,7 +44,7 @@ func newBuildArgs(argsFromOptions map[string]*string) *buildArgs {
 
 // WarnOnUnusedBuildArgs checks if there are any leftover build-args that were
 // passed but not consumed during build. Print a warning, if there are any.
-func (b *buildArgs) WarnOnUnusedBuildArgs(out io.Writer) {
+func (b *BuildArgs) WarnOnUnusedBuildArgs(out io.Writer) {
 	leftoverArgs := []string{}
 	for arg := range b.argsFromOptions {
 		_, isReferenced := b.referencedArgs[arg]
@@ -59,17 +60,17 @@ func (b *buildArgs) WarnOnUnusedBuildArgs(out io.Writer) {
 
 // ResetAllowed clears the list of args that are allowed to be used by a
 // directive
-func (b *buildArgs) ResetAllowed() {
+func (b *BuildArgs) ResetAllowed() {
 	b.allowedBuildArgs = make(map[string]*string)
 }
 
 // AddMetaArg adds a new meta arg that can be used by FROM directives
-func (b *buildArgs) AddMetaArg(key string, value *string) {
+func (b *BuildArgs) AddMetaArg(key string, value *string) {
 	b.allowedMetaArgs[key] = value
 }
 
 // AddArg adds a new arg that can be used by directives
-func (b *buildArgs) AddArg(key string, value *string) {
+func (b *BuildArgs) AddArg(key string, value *string) {
 	b.allowedBuildArgs[key] = value
 	b.referencedArgs[key] = struct{}{}
 }
@@ -77,23 +78,23 @@ func (b *buildArgs) AddArg(key string, value *string) {
 // IsReferencedOrNotBuiltin checks if the key is a built-in arg, or if it has been
 // referenced by the Dockerfile. Returns true if the arg is not a builtin or
 // if the builtin has been referenced in the Dockerfile.
-func (b *buildArgs) IsReferencedOrNotBuiltin(key string) bool {
+func (b *BuildArgs) IsReferencedOrNotBuiltin(key string) bool {
 	_, isBuiltin := builtinAllowedBuildArgs[key]
 	_, isAllowed := b.allowedBuildArgs[key]
 	return isAllowed || !isBuiltin
 }
 
 // GetAllAllowed returns a mapping with all the allowed args
-func (b *buildArgs) GetAllAllowed() map[string]string {
+func (b *BuildArgs) GetAllAllowed() map[string]string {
 	return b.getAllFromMapping(b.allowedBuildArgs)
 }
 
 // GetAllMeta returns a mapping with all the meta meta args
-func (b *buildArgs) GetAllMeta() map[string]string {
+func (b *BuildArgs) GetAllMeta() map[string]string {
 	return b.getAllFromMapping(b.allowedMetaArgs)
 }
 
-func (b *buildArgs) getAllFromMapping(source map[string]*string) map[string]string {
+func (b *BuildArgs) getAllFromMapping(source map[string]*string) map[string]string {
 	m := make(map[string]string)
 
 	keys := keysFromMaps(source, builtinAllowedBuildArgs)
@@ -107,7 +108,7 @@ func (b *buildArgs) getAllFromMapping(source map[string]*string) map[string]stri
 }
 
 // FilterAllowed returns all allowed args without the filtered args
-func (b *buildArgs) FilterAllowed(filter []string) []string {
+func (b *BuildArgs) FilterAllowed(filter []string) []string {
 	envs := []string{}
 	configEnv := opts.ConvertKVStringsToMap(filter)
 
@@ -119,7 +120,7 @@ func (b *buildArgs) FilterAllowed(filter []string) []string {
 	return envs
 }
 
-func (b *buildArgs) getBuildArg(key string, mapping map[string]*string) (string, bool) {
+func (b *BuildArgs) getBuildArg(key string, mapping map[string]*string) (string, bool) {
 	defaultValue, exists := mapping[key]
 	// Return override from options if one is defined
 	if v, ok := b.argsFromOptions[key]; ok && v != nil {

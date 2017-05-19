@@ -99,7 +99,7 @@ type Builder struct {
 
 	disableCommit bool
 	cacheBusted   bool
-	buildArgs     *buildArgs
+	buildArgs     *builder.BuildArgs
 	imageCache    builder.ImageCache
 	imageSources  builder.ImageMounts
 
@@ -120,7 +120,7 @@ func newBuilder(clientCtx context.Context, options builderOptions) *Builder {
 		Aux:          options.ProgressWriter.AuxFormatter,
 		Output:       options.ProgressWriter.Output,
 		docker:       options.Backend,
-		buildArgs:    newBuildArgs(config.BuildArgs),
+		buildArgs:    builder.NewBuildArgs(config.BuildArgs),
 		imageSources: newImageSources(clientCtx, options),
 		buildTree:    buildtree.NewBuildTree(),
 	}
@@ -174,6 +174,8 @@ func (b *Builder) build(source builder.Source, dockerfile *parser.Result) (*buil
 		Output:        b.Output,
 		Stderr:        b.Stderr,
 		Stdout:        b.Stdout,
+		BuildArgs:     b.buildArgs,
+		Source:        b.source,
 	}
 
 	return b.buildTree.Run(treeOptions)

@@ -4,16 +4,12 @@ package buildtree
 // non-contiguous functionality. Please read the comments.
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
-	"runtime"
-	"sort"
 	"strings"
 	"time"
 
@@ -78,13 +74,6 @@ func (b *stageContext) commitContainer(id string, containerConfig *container.Con
 
 	b.imageID = imageID
 	return nil
-}
-
-type copyInfo struct {
-	root       string
-	path       string
-	hash       string
-	decompress bool
 }
 
 type runConfigModifier func(*container.Config)
@@ -230,146 +219,6 @@ func (b *buildContext) download(srcURL string) (remote builder.Source, p string,
 var windowsBlacklist = map[string]bool{
 	"c:\\":        true,
 	"c:\\windows": true,
-}
-
-func (b *stageContext) calcCopyInfo(cmdName, origPath string, allowLocalDecompression, allowWildcards bool, imageSource builder.ImageMount) ([]copyInfo, error) {
-
-	// Work in daemon-specific OS filepath semantics
-	origPath = filepath.FromSlash(origPath)
-	// validate windows paths from other images
-	if imageSource != nil && runtime.GOOS == "windows" {
-		p := strings.ToLower(filepath.Clean(origPath))
-		if !filepath.IsAbs(p) {
-			if filepath.VolumeName(p) != "" {
-				if p[len(p)-2:] == ":." { // case where clean returns weird c:. paths
-					p = p[:len(p)-1]
-				}
-				p += "\\"
-			} else {
-				p = filepath.Join("c:\\", p)
-			}
-		}
-		if _, blacklisted := windowsBlacklist[p]; blacklisted {
-			return nil, errors.New("copy from c:\\ or c:\\windows is not allowed on windows")
-		}
-	}
-
-	if origPath != "" && origPath[0] == os.PathSeparator && len(origPath) > 1 {
-		origPath = origPath[1:]
-	}
-	origPath = strings.TrimPrefix(origPath, "."+string(os.PathSeparator))
-
-	source := b.source
-	var err error
-	if imageSource != nil {
-		source, err = imageSource.Source()
-		if err != nil {
-			return nil, errors.Wrapf(err, "failed to copy")
-		}
-	}
-
-	if source == nil {
-		return nil, errors.Errorf("No context given. Impossible to use %s", cmdName)
-	}
-
-	// Deal with wildcards
-	if allowWildcards && containsWildcards(origPath) {
-		var copyInfos []copyInfo
-		if err := filepath.Walk(source.Root(), func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return err
-			}
-			rel, err := remotecontext.Rel(source.Root(), path)
-			if err != nil {
-				return err
-			}
-			if rel == "." {
-				return nil
-			}
-			if match, _ := filepath.Match(origPath, rel); !match {
-				return nil
-			}
-
-			// Note we set allowWildcards to false in case the name has
-			// a * in it
-			subInfos, err := b.calcCopyInfo(cmdName, rel, allowLocalDecompression, false, imageSource)
-			if err != nil {
-				return err
-			}
-			copyInfos = append(copyInfos, subInfos...)
-			return nil
-		}); err != nil {
-			return nil, err
-		}
-		return copyInfos, nil
-	}
-
-	// Must be a dir or a file
-	hash, err := source.Hash(origPath)
-	if err != nil {
-		return nil, err
-	}
-
-	fi, err := remotecontext.StatAt(source, origPath)
-	if err != nil {
-		return nil, err
-	}
-
-	// TODO: remove, handle dirs in Hash()
-	copyInfos := []copyInfo{{root: source.Root(), path: origPath, hash: hash, decompress: allowLocalDecompression}}
-
-	if imageSource != nil {
-		// fast-cache based on imageID
-		if h, ok := b.commonContext.pathCache.Load(imageSource.Image().ImageID() + origPath); ok {
-			copyInfos[0].hash = h.(string)
-			return copyInfos, nil
-		}
-	}
-
-	// Deal with the single file case
-	if !fi.IsDir() {
-		copyInfos[0].hash = "file:" + copyInfos[0].hash
-		return copyInfos, nil
-	}
-
-	fp, err := remotecontext.FullPath(source, origPath)
-	if err != nil {
-		return nil, err
-	}
-	// Must be a dir
-	var subfiles []string
-	err = filepath.Walk(fp, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, err := remotecontext.Rel(source.Root(), path)
-		if err != nil {
-			return err
-		}
-		if rel == "." {
-			return nil
-		}
-		hash, err := source.Hash(rel)
-		if err != nil {
-			return nil
-		}
-		// we already checked handleHash above
-		subfiles = append(subfiles, hash)
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	sort.Strings(subfiles)
-	hasher := sha256.New()
-	hasher.Write([]byte(strings.Join(subfiles, ",")))
-	copyInfos[0].hash = "dir:" + hex.EncodeToString(hasher.Sum(nil))
-	if imageSource != nil {
-		b.commonContext.pathCache.Store(imageSource.Image().ImageID()+origPath, copyInfos[0].hash)
-	}
-
-	return copyInfos, nil
 }
 
 // probeCache checks if cache match can be found for current build instruction.
@@ -533,4 +382,53 @@ func (b *stageContext) clearTmp() {
 		delete(b.tmpContainers, c)
 		fmt.Fprintf(b.commonContext.stdout, "Removing intermediate container %s\n", stringid.TruncateID(c))
 	}
+}
+
+// For backwards compat, if there's just one info then use it as the
+// cache look-up string, otherwise hash 'em all into one
+func getSourceHashFromInfos(infos []copyInfo) string {
+	if len(infos) == 1 {
+		return infos[0].hash
+	}
+	var hashs []string
+	for _, info := range infos {
+		hashs = append(hashs, info.hash)
+	}
+	return hashStringSlice("multi", hashs)
+}
+
+func (b *stageContext) performCopy(inst copyInstruction) error {
+	srcHash := getSourceHashFromInfos(inst.infos)
+
+	// TODO: should this have been using origPaths instead of srcHash in the comment?
+	runConfigWithCommentCmd := copyRunConfig(
+		b.runConfig,
+		withCmdCommentString(fmt.Sprintf("%s %s in %s ", inst.cmdName, srcHash, inst.dest)))
+	if hit, err := b.probeCache(runConfigWithCommentCmd); err != nil || hit {
+		return err
+	}
+
+	container, err := b.commonContext.docker.ContainerCreate(types.ContainerCreateConfig{
+		Config: runConfigWithCommentCmd,
+		// Set a log config to override any default value set on the daemon
+		HostConfig: &container.HostConfig{LogConfig: defaultLogConfig},
+	})
+	if err != nil {
+		return err
+	}
+	b.tmpContainers[container.ID] = struct{}{}
+
+	// Twiddle the destination when it's a relative path - meaning, make it
+	// relative to the WORKINGDIR
+	dest, err := normaliseDest(inst.cmdName, b.runConfig.WorkingDir, inst.dest)
+	if err != nil {
+		return err
+	}
+
+	for _, info := range inst.infos {
+		if err := b.commonContext.docker.CopyOnBuild(container.ID, dest, info.root, info.path, inst.allowLocalDecompression); err != nil {
+			return err
+		}
+	}
+	return b.commitContainer(container.ID, runConfigWithCommentCmd)
 }

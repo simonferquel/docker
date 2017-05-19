@@ -3,10 +3,12 @@
 package buildtree
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/docker/docker/builder"
 	"github.com/docker/docker/pkg/system"
 )
 
@@ -27,6 +29,20 @@ func normaliseDest(cmdName, workingDir, requested string) (string, error) {
 	return dest, nil
 }
 
+// normaliseWorkdir normalises a user requested working directory in a
+// platform semantically consistent way.
+func normaliseWorkdir(current string, requested string) (string, error) {
+	if requested == "" {
+		return "", errors.New("cannot normalise nothing")
+	}
+	current = filepath.FromSlash(current)
+	requested = filepath.FromSlash(requested)
+	if !filepath.IsAbs(requested) {
+		return filepath.Join(string(os.PathSeparator), current, requested), nil
+	}
+	return requested, nil
+}
+
 func containsWildcards(name string) bool {
 	for i := 0; i < len(name); i++ {
 		ch := name[i]
@@ -37,4 +53,8 @@ func containsWildcards(name string) bool {
 		}
 	}
 	return false
+}
+
+func validateCopySourcePath(imageSource builder.ImageMount, origPath string) error {
+	return nil
 }

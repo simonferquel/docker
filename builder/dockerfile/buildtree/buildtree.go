@@ -30,6 +30,10 @@ type BuildOptions struct {
 	Output io.Writer
 	Stdout io.Writer
 	Stderr io.Writer
+
+	BuildArgs *builder.BuildArgs
+
+	Source builder.Source
 }
 
 // BuildTree represent a complete build operation
@@ -51,9 +55,12 @@ type BuildTree interface {
 type BuildStage interface {
 	Name() string
 	addStep(step BuildStep)
+	run(ctx *stageContext)
+	base() StageOrImage
 }
 
 type BuildStep interface {
+	run(ctx *stageContext) error
 }
 
 type buildTree struct {
@@ -106,6 +113,8 @@ func (t *buildTree) Run(options *BuildOptions) (*builder.Result, error) {
 		stdout:         options.Stdout,
 		stderr:         options.Stderr,
 		stagesContexts: make(map[string]*stageContext),
+		buildArgs:      options.BuildArgs,
+		source:         options.Source,
 	}
 	contexts := []stageAndContext{}
 	for _, stage := range t.stages {
@@ -120,20 +129,19 @@ func (t *buildTree) Run(options *BuildOptions) (*builder.Result, error) {
 
 	for _, stage := range contexts {
 		s := stage
-		go func() {
-			// s.stage.Run(stage.context)
-			close(s.context.done)
-		}()
+		// go func() {
+		// 	s.stage.run(stage.context)
+		// }()
+		s.stage.run(stage.context)
 	}
 
 	for _, stage := range contexts {
 		<-stage.context.done
 	}
 
-	// lastStage := contexts[len(contexts-1)]
-	// return lastStage.result, lastStage.err
+	lastStage := contexts[len(contexts)-1]
+	return lastStage.context.result, lastStage.context.err
 
-	return nil, errors.New("Not implemented")
 }
 
 func (t *buildTree) AddStage(stage BuildStage) error {
@@ -170,6 +178,13 @@ type StageOrImage struct {
 	Stage BuildStage
 }
 
+func (si StageOrImage) RootImage() builder.Image {
+	if si.Image != nil {
+		return si.Image
+	}
+	return si.Stage.base().RootImage()
+}
+
 type buildStage struct {
 	name      string
 	baseImage StageOrImage
@@ -185,6 +200,32 @@ func (s *buildStage) Name() string {
 }
 func (s *buildStage) addStep(step BuildStep) {
 	s.steps = append(s.steps, step)
+}
+
+func (s *buildStage) base() StageOrImage {
+	return s.baseImage
+}
+
+func (s *buildStage) run(ctx *stageContext) {
+	for _, step := range s.steps {
+		select {
+		case <-ctx.commonContext.ctx.Done():
+			// cancel
+			ctx.err = errors.New("Build canceled")
+			close(ctx.done)
+			return
+		default:
+			// continue
+		}
+
+		if err := step.run(ctx); err != nil {
+			ctx.err = err
+			close(ctx.done)
+			return
+		}
+	}
+	ctx.result = &builder.Result{FromImage: s.baseImage.RootImage(), ImageID: ctx.imageID}
+	close(ctx.done)
 }
 
 type envBuildStep struct {

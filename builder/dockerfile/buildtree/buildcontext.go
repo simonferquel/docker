@@ -25,8 +25,10 @@ type buildContext struct {
 	output io.Writer
 	stdout io.Writer
 	stderr io.Writer
+	source builder.Source
 
 	stagesContexts map[string]*stageContext
+	buildArgs      *builder.BuildArgs
 }
 
 type pathCache interface {
@@ -47,6 +49,8 @@ type stageContext struct {
 
 	result *builder.Result
 	err    error
+
+	cmdSet bool
 }
 
 func (s *stageContext) update(imageId string, runConfig *container.Config) {
