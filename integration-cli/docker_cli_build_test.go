@@ -1174,12 +1174,13 @@ func (s *DockerSuite) TestBuildForceRm(c *check.C) {
 	containerCountBefore := getContainerCount(c)
 	name := "testbuildforcerm"
 
-	buildImage(name, cli.WithFlags("--force-rm"), build.WithBuildContext(c,
-		build.WithFile("Dockerfile", `FROM `+minimalBaseImage()+`
+	r := buildImage(name, cli.WithFlags("--force-rm"), build.WithBuildContext(c,
+		build.WithFile("Dockerfile", `FROM busybox
 	RUN true
-	RUN thiswillfail`))).Assert(c, icmd.Expected{
-		ExitCode: 1,
-	})
+	RUN thiswillfail`)))
+	if r.ExitCode != 1 && r.ExitCode != 127 { // different on Linux / Windows
+		c.Fatalf("Wrong exit code")
+	}
 
 	containerCountAfter := getContainerCount(c)
 	if containerCountBefore != containerCountAfter {
@@ -4524,7 +4525,6 @@ func (s *DockerSuite) TestBuildBuildTimeArgOverrideEnvDefinedBeforeArg(c *check.
 }
 
 func (s *DockerSuite) TestBuildBuildTimeArgExpansion(c *check.C) {
-	testRequires(c, DaemonIsLinux) // Windows does not support ARG
 	imgName := "bldvarstest"
 
 	wdVar := "WDIR"
@@ -4541,6 +4541,10 @@ func (s *DockerSuite) TestBuildBuildTimeArgExpansion(c *check.C) {
 	userVal := "testUser"
 	volVar := "VOL"
 	volVal := "/testVol/"
+	if DaemonIsWindows() {
+		volVal = "C:\\testVol"
+		wdVal = "C:\\tmp"
+	}
 
 	buildImageSuccessfully(c, imgName,
 		cli.WithFlags(
@@ -4576,7 +4580,7 @@ func (s *DockerSuite) TestBuildBuildTimeArgExpansion(c *check.C) {
 	)
 
 	res := inspectField(c, imgName, "Config.WorkingDir")
-	c.Check(res, check.Equals, filepath.ToSlash(wdVal))
+	c.Check(filepath.ToSlash(res), check.Equals, filepath.ToSlash(wdVal))
 
 	var resArr []string
 	inspectFieldAndUnmarshall(c, imgName, "Config.Env", &resArr)
