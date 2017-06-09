@@ -112,6 +112,7 @@ type dispatchState struct {
 	baseImage         builder.Image
 	stageName         string
 	hasDispatchedFrom bool
+	buildStage        *buildStage
 }
 
 type stageBuilder struct {
@@ -121,13 +122,13 @@ type stageBuilder struct {
 	source  builder.Source
 }
 
-func newDispatchState() *dispatchState {
-	return &dispatchState{runConfig: &container.Config{}}
+func newDispatchState(stage *buildStage) *dispatchState {
+	return &dispatchState{runConfig: &container.Config{}, buildStage: stage}
 }
 
-func newStageBuilder(builder *Builder, escapeToken rune, source builder.Source) *stageBuilder {
+func newStageBuilder(builder *Builder, escapeToken rune, source builder.Source, stage *buildStage) *stageBuilder {
 	return &stageBuilder{
-		state:   newDispatchState(),
+		state:   newDispatchState(stage),
 		shlex:   NewShellLex(escapeToken),
 		builder: builder,
 		source:  source,

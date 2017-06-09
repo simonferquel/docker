@@ -7,6 +7,8 @@ import (
 	"io/ioutil"
 	"strings"
 
+	"sync"
+
 	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/backend"
@@ -195,8 +197,14 @@ func (b *Builder) processMetaArg(meta instructions.ArgCommand, shlex *ShellLex) 
 	b.buildArgs.AddMetaArg(meta.Name, meta.Value)
 	return nil
 }
+
+type stageBuilderAndCommands struct {
+	builder  *stageBuilder
+	commands []interface{}
+	err      error
+}
+
 func (b *Builder) dispatchDockerfileWithCancellation(parseResult []instructions.BuildableStage, metaArgs []instructions.ArgCommand, escapeToken rune, source builder.Source) (*dispatchState, error) {
-	var stageBuilder *stageBuilder
 
 	totalCommands := len(metaArgs)
 	currentCommandIndex := 1
@@ -216,39 +224,60 @@ func (b *Builder) dispatchDockerfileWithCancellation(parseResult []instructions.
 		}
 	}
 
+	prepedStages := []*stageBuilderAndCommands{}
 	for _, stage := range parseResult {
-		stageBuilder = newStageBuilder(b, escapeToken, source)
-		for _, cmd := range stage.Commands {
-			select {
-			case <-b.clientCtx.Done():
-				logrus.Debug("Builder: build cancelled!")
-				fmt.Fprint(b.Stdout, "Build cancelled\n")
-				buildsFailed.WithValues(metricsBuildCanceled).Inc()
-				return nil, errors.New("Build cancelled")
-			default:
-				// Not cancelled yet, keep going...
-			}
-
-			fmt.Fprintf(b.Stdout, stepFormat, currentCommandIndex, totalCommands, cmd)
-			currentCommandIndex++
-			fmt.Fprintln(b.Stdout)
-
-			if err := stageBuilder.dispatch(cmd); err != nil {
-				return nil, err
-			}
-
-			stageBuilder.updateRunConfig()
-			fmt.Fprintf(b.Stdout, " ---> %s\n", stringid.TruncateID(stageBuilder.state.imageID))
-
-		}
-		if err := emitImageID(b.Aux, stageBuilder.state); err != nil {
+		buildStage, err := b.buildStages.add(stage.Name)
+		if err != nil {
 			return nil, err
 		}
+		prepedStages = append(prepedStages, &stageBuilderAndCommands{builder: newStageBuilder(b, escapeToken, source, buildStage), commands: stage.Commands})
 	}
+	wg := &sync.WaitGroup{}
+	for _, s := range prepedStages {
+		stage := s
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for _, cmd := range stage.commands {
+				select {
+				case <-b.clientCtx.Done():
+					logrus.Debug("Builder: build cancelled!")
+					fmt.Fprint(b.Stdout, "Build cancelled\n")
+					buildsFailed.WithValues(metricsBuildCanceled).Inc()
+					stage.err = errors.New("Build cancelled")
+					stage.builder.state.buildStage.fail()
+					return
+				default:
+					// Not cancelled yet, keep going...
+				}
+
+				fmt.Fprintf(b.Stdout, stepFormat, currentCommandIndex, totalCommands, cmd)
+				currentCommandIndex++
+				fmt.Fprintln(b.Stdout)
+
+				if err := stage.builder.dispatch(cmd); err != nil {
+					stage.err = err
+					stage.builder.state.buildStage.fail()
+					return
+				}
+
+				stage.builder.updateRunConfig()
+				fmt.Fprintf(b.Stdout, " ---> %s\n", stringid.TruncateID(stage.builder.state.imageID))
+
+			}
+			if err := emitImageID(b.Aux, stage.builder.state); err != nil {
+				stage.err = err
+				stage.builder.state.buildStage.fail()
+				return
+			}
+			stage.builder.state.buildStage.complete()
+		}()
+	}
+	wg.Wait()
 	if b.options.Remove {
 		b.containerManager.RemoveAll(b.Stdout)
 	}
-	return stageBuilder.state, nil
+	return prepedStages[len(prepedStages)-1].builder.state, prepedStages[len(prepedStages)-1].err
 }
 
 func addNodesForLabelOption(dockerfile *parser.Node, labels map[string]string) {

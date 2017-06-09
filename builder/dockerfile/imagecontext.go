@@ -16,10 +16,17 @@ import (
 type buildStage struct {
 	id     string
 	config *container.Config
+	done   chan struct{}
+	failed chan struct{}
 }
 
-func newBuildStageFromImage(image builder.Image) *buildStage {
-	return &buildStage{id: image.ImageID(), config: image.RunConfig()}
+func newBuildStage() *buildStage {
+	return &buildStage{done: make(chan struct{}), failed: make(chan struct{})}
+}
+
+func (b *buildStage) Init(image builder.Image) {
+	b.id = image.ImageID()
+	b.config = image.RunConfig()
 }
 
 func (b *buildStage) ImageID() string {
@@ -35,6 +42,24 @@ func (b *buildStage) update(imageID string, runConfig *container.Config) {
 	b.config = runConfig
 }
 
+func (b *buildStage) complete() {
+	close(b.done)
+}
+func (b *buildStage) fail() {
+	close(b.failed)
+}
+
+func (b *buildStage) wait(cancelCtx context.Context) error {
+	select {
+	case <-b.done:
+		return nil
+	case <-b.failed:
+		return errors.New("Parent stage failed")
+	case <-cancelCtx.Done():
+		return errors.New("Build canceled")
+	}
+}
+
 var _ builder.Image = &buildStage{}
 
 // buildStages tracks each stage of a build so they can be retrieved by index
@@ -48,20 +73,25 @@ func newBuildStages() *buildStages {
 	return &buildStages{byName: make(map[string]*buildStage)}
 }
 
-func (s *buildStages) getByName(name string) (builder.Image, bool) {
+func (s *buildStages) getByName(cancelCtx context.Context, name string) (builder.Image, bool) {
 	stage, ok := s.byName[strings.ToLower(name)]
+	if ok {
+		stage.wait(cancelCtx)
+	}
 	return stage, ok
 }
 
-func (s *buildStages) get(indexOrName string) (builder.Image, error) {
+func (s *buildStages) get(cancelCtx context.Context, indexOrName string) (builder.Image, error) {
 	index, err := strconv.Atoi(indexOrName)
 	if err == nil {
 		if err := s.validateIndex(index); err != nil {
 			return nil, err
 		}
-		return s.sequence[index], nil
+		stage := s.sequence[index]
+		stage.wait(cancelCtx)
+		return stage, nil
 	}
-	if im, ok := s.byName[strings.ToLower(indexOrName)]; ok {
+	if im, ok := s.getByName(cancelCtx, indexOrName); ok {
 		return im, nil
 	}
 	return nil, nil
@@ -77,21 +107,17 @@ func (s *buildStages) validateIndex(i int) error {
 	return nil
 }
 
-func (s *buildStages) add(name string, image builder.Image) error {
-	stage := newBuildStageFromImage(image)
+func (s *buildStages) add(name string) (*buildStage, error) {
+	stage := newBuildStage()
 	name = strings.ToLower(name)
 	if len(name) > 0 {
 		if _, ok := s.byName[name]; ok {
-			return errors.Errorf("duplicate name %s", name)
+			return nil, errors.Errorf("duplicate name %s", name)
 		}
 		s.byName[name] = stage
 	}
 	s.sequence = append(s.sequence, stage)
-	return nil
-}
-
-func (s *buildStages) update(imageID string, runConfig *container.Config) {
-	s.sequence[len(s.sequence)-1].update(imageID, runConfig)
+	return stage, nil
 }
 
 type getAndMountFunc func(string) (builder.Image, builder.ReleaseableLayer, error)

@@ -129,7 +129,7 @@ func (b *Builder) getImageMount(imageRefOrID string) (*imageMount, error) {
 		return nil, nil
 	}
 
-	stage, err := b.buildStages.get(imageRefOrID)
+	stage, err := b.buildStages.get(b.clientCtx, imageRefOrID)
 	if err != nil {
 		return nil, err
 	}
@@ -147,9 +147,7 @@ func (d *stageBuilder) dispatchFrom(cmd *instructions.FromCommand) error {
 	if err != nil {
 		return err
 	}
-	if err := d.builder.buildStages.add(cmd.StageName, image); err != nil {
-		return err
-	}
+	d.state.buildStage.Init(image)
 	state := d.state
 	state.beginStage(cmd.StageName, image)
 	d.builder.buildArgs.ResetAllowed()
@@ -205,7 +203,7 @@ func (b *Builder) getExpandedImageName(shlex *ShellLex, name string) (string, er
 	return name, nil
 }
 func (b *Builder) getImageOrStage(name string) (builder.Image, error) {
-	if im, ok := b.buildStages.getByName(name); ok {
+	if im, ok := b.buildStages.getByName(b.clientCtx, name); ok {
 		return im, nil
 	}
 
